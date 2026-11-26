@@ -507,10 +507,10 @@ const items=array(object({id:string,sku:string,x:integer,y:integer,facing:enumer
   ['id','sku','x','y','facing']),32)
 const skus=object({skus:{...array(string,32),minItems:1}},['skus'])
 const tools=[
-  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts),'compatibility','suppliers','room-modes'),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic','adaptation','rules')})],
+  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts),'compatibility','suppliers','room-modes','delivery'),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic','adaptation','rules')})],
   ['select_task','Начать новый эпизод и сбросить виртуальные заказы',object({id:string},['id'])],
   ['get_task','План, требования, сроки и бюджет текущей задачи',object({})],
-  ['arena_action','Выполнить действие в эпизоде rules и получить наблюдение и награду. Типы: order, cancel, place, submit',
+  ['arena_action','Выполнить действие в эпизоде rules и получить наблюдение и награду. Типы: order, cancel, place, package, carry, submit',
     object({action:{type:'object',additionalProperties:true}},['action'])],
   ['arena_result','Пересчитать результат текущего эпизода rules без изменения состояния',object({})],
   ['search_products','Поиск по каталогу виртуального магазина. Размеры в сантиметрах, цены в рублях',
