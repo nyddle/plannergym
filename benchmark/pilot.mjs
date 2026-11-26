@@ -228,16 +228,74 @@ function buildTask(kind,index) {
 }
 
 const cases = Object.entries(counts).flatMap(([kind,count])=>Array.from({length:count},(_,i)=>buildTask(kind,i)))
-export function listTasks({kind,split}={}){
-  return cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split))
-    .map(({id,kind,split,family,budget,deadline})=>({id,kind,split,family,budget,deadline}))
+const pilots=cases.slice()
+
+function variations(task,reference){
+  const layout=task.layouts.find(l=>l.id===reference.layout)
+  if(task.kind==='furnishing'){
+    const room=layout.rooms[0]
+    return [-60,-40,-20,20,40,60].map(delta=>['door-offset',candidate=>{
+      const target=candidate.layouts[0].rooms[0]
+      target.door.x=room.door.x+delta
+      target.aisle.x=target.door.x
+    }])
+  }
+  if(task.kind==='project'){
+    if(reference.layout!=='existing')return []
+    const id=layout.rooms.find(r=>r.id==='utility').niches[0].id
+    return [['existing-niche-width',candidate=>{
+      candidate.layouts[0].rooms.find(r=>r.id==='utility').niches.find(n=>n.id===id).w=40
+    }]]
+  }
+  if(task.kind==='procurement'){
+    return [...tally(reference.order)].filter(([,quantity])=>quantity>1).map(([sku,quantity])=>['stock',candidate=>{
+      candidate.catalog.find(p=>p.sku===sku).stock=quantity-1
+    }])
+  }
+  return [...new Set(reference.order)].map(sku=>['installation-depth',candidate=>{
+    candidate.catalog.find(p=>p.sku===sku).serviceDepth+=15
+  }])
+}
+
+function diagnosticPairs(){
+  const pairs=[]
+  for(const kind of Object.keys(counts)){
+    let number=0
+    for(const original of pilots.filter(({task})=>task.kind===kind)){
+      if(number===5)break
+      const base=structuredClone(original.task)
+      if(kind!=='furnishing')base.budget+=9000
+      const reference=findReference(base)
+      for(const [factor,change] of variations(base,reference)){
+        const variant=structuredClone(base)
+        change(variant)
+        if(assess(variant,reference,reference.order).passed)continue
+        let alternative
+        try {alternative=findReference(variant)} catch {continue}
+        const pair=`pair-${kind}-${++number}`
+        Object.assign(base,{id:pair+'-a',pair,variant:'a',factor,source:original.task.id})
+        Object.assign(variant,{id:pair+'-b',pair,variant:'b',factor,source:original.task.id})
+        pairs.push([{task:base,reference},{task:variant,reference:alternative}])
+        break
+      }
+    }
+    if(number!==5)throw Error(`Не удалось собрать пять диагностических пар: ${kind}, получено ${number}`)
+  }
+  return pairs
+}
+const pairs=diagnosticPairs()
+cases.push(...pairs.flat())
+
+export function listTasks({kind,split,suite}={}){
+  return cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split)&&(!suite||(suite==='diagnostic')===Boolean(t.pair)))
+    .map(({id,kind,split,family,budget,deadline,pair,variant,factor,source})=>({id,kind,split,family,budget,deadline,pair,variant,factor,source}))
 }
 export function selectTask(id){
   const found=cases.find(({task})=>task.id===id)
   if(!found)throw Error(`Неизвестная задача ${id}`)
   const {task}=found
   const orders=new Map()
-  let nextOrder=1, previousScore=0, steps=0
+  let nextOrder=1, previousScore=0, steps=0, actions=0
   const inventory=()=>[...orders.values()].flat()
   const available=()=>{
     const held=tally(inventory())
@@ -260,16 +318,19 @@ export function selectTask(id){
     },
     quote_cart:({skus})=>cart(skus),
     place_order:({skus})=>{
+      actions++
       const result=cart(skus)
       const order_id=String(nextOrder++)
       orders.set(order_id,skus.slice())
       return {order_id,...result}
     },
     cancel_order:({order_id})=>{
+      actions++
       if(!orders.delete(order_id))throw Error('Заказ не найден')
       return {order_id,canceled:true}
     },
     evaluate:({layout,items})=>{
+      actions++
       const result=assess(task,{layout,items},inventory())
       // Every placed order incurs its own delivery charge.
       const extraDelivery=Math.max(0,orders.size-1)*deliveryFee
@@ -278,7 +339,7 @@ export function selectTask(id){
       if(result.errors.length){result.passed=false;result.score=0}
       const reward=result.score-previousScore
       previousScore=result.score
-      return {...result,reward,evaluation:++steps}
+      return {...result,reward,evaluation:++steps,actions}
     }
   }
 }
@@ -286,7 +347,7 @@ export function selectTask(id){
 export function verifyPilot(){
   const countsByKind={}, splitFamilies=new Map()
   let shiftedProjects=0
-  for(const {task,reference} of cases){
+  for(const {task,reference} of pilots){
     const environment=selectTask(task.id)
     if(reference.order.length){
       if(environment.evaluate(reference).passed)throw Error(`Принято без заказа: ${task.id}`)
@@ -307,7 +368,51 @@ export function verifyPilot(){
     countsByKind[task.kind]=(countsByKind[task.kind]??0)+1
   }
   if(shiftedProjects!==5)throw Error('Ожидалось пять проектов с переносом перегородки')
-  return {total:cases.length,counts:countsByKind,shiftedProjects,splits:Object.fromEntries(tally(cases.map(({task})=>task.split)))}
+  return {total:pilots.length,counts:countsByKind,shiftedProjects,splits:Object.fromEntries(tally(pilots.map(({task})=>task.split)))}
+}
+
+function runAnswer(task,answer){
+  const episode=selectTask(task.id)
+  try {
+    if(answer.order.length)episode.place_order({skus:answer.order})
+  } catch(error) {
+    const result=episode.evaluate(answer)
+    return {...result,errors:[error.message,...result.errors]}
+  }
+  return episode.evaluate(answer)
+}
+
+function cheapestAnswer(task) {
+  const cheapest=new Set()
+  for(const category of new Set(task.requirements.map(r=>r.category))){
+    const product=task.catalog.filter(p=>p.category===category&&p.stock>0&&p.days<=task.deadline)
+      .sort((a,b)=>(a.price+a.assembly)-(b.price+b.assembly))[0]
+    if(product)cheapest.add(product.sku)
+  }
+  const owned=new Set(task.requirements.map(r=>r.owned))
+  const restricted={...task,layouts:task.layouts.slice(0,1),catalog:task.catalog.filter(p=>cheapest.has(p.sku)||owned.has(p.sku))}
+  try {return findReference(restricted)} catch {return null}
+}
+
+export function diagnose(){
+  const baselineTotals={a:0,b:0}
+  const results=pairs.map(([a,b])=>{
+    const first=runAnswer(a.task,a.reference)
+    const second=runAnswer(b.task,b.reference)
+    const replay=runAnswer(b.task,a.reference)
+    if(!first.passed||!second.passed||replay.passed)throw Error(`Невалидная пара: ${a.task.pair}`)
+    const baseline=[a,b].map(({task},index)=>{
+      const plan=cheapestAnswer(task)
+      if(!plan)return {passed:false}
+      const result=runAnswer(task,plan)
+      if(result.passed)baselineTotals[index===0?'a':'b']++
+      return result
+    })
+    return {pair:a.task.pair,kind:a.task.kind,factor:a.task.factor,split:a.task.split,
+      reference:[first,second],replay,baseline}
+  })
+  return {pairs:results.length,episodes:results.length*2,
+    referencePassed:results.length*2,replayPassed:0,baselinePassed:baselineTotals,results}
 }
 
 const string={type:'string'}, integer={type:'integer',minimum:0}
@@ -318,7 +423,7 @@ const items=array(object({id:string,sku:string,x:integer,y:integer,facing:enumer
   ['id','sku','x','y','facing']),32)
 const skus=object({skus:{...array(string,32),minItems:1}},['skus'])
 const tools=[
-  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts)),split:enumeration('train','validation','test')})],
+  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts)),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic')})],
   ['select_task','Начать новый эпизод и сбросить виртуальные заказы',object({id:string},['id'])],
   ['get_task','План, требования, сроки и бюджет текущей задачи',object({})],
   ['search_products','Поиск по каталогу виртуального магазина. Размеры в сантиметрах, цены в рублях',
@@ -396,8 +501,9 @@ function runMcp(){
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
   const [command,id]=process.argv.slice(2)
   if(command==='verify')console.log(JSON.stringify(verifyPilot(),null,2))
+  else if(command==='diagnose')console.log(JSON.stringify(diagnose(),null,2))
   else if(command==='list')console.log(JSON.stringify(listTasks(),null,2))
   else if(command==='mcp')runMcp()
   else if(command==='show')console.log(JSON.stringify(selectTask(id).get_task(),null,2))
-  else throw Error('Используйте verify, list, show <id> или mcp')
+  else throw Error('Используйте verify, diagnose, list, show <id> или mcp')
 }
