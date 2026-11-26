@@ -55,7 +55,7 @@ export function deliveryRecords(){
     const cohort=i<12?'ordinary':i<24?'paired':'event'
     const variant=cohort==='paired'?(i%2?'b':'a'):null
     const n=variant?12+Math.floor((i-12)/2):i
-    const corner=5+n%4, depth=9+Math.floor(n/4)%4
+    const corner=5+n%4, depth=variant&&n>=16?13+n%2:9+Math.floor(n/4)%4
     const wide=variant==='a'||cohort==='event'||(cohort==='ordinary'&&n%2===0)
     const grid=makeGrid(corner,depth,wide)
     const task={
@@ -107,24 +107,24 @@ export function verifyDelivery(task,log,rulesVersion){
     rulesVersion,terminated,observation:{package:pack?.id??null,pose,event,grid:event?.grid??task.grid}}
 }
 
-export function calibrateDelivery(records,rulesVersion){
-  const delivery=records.filter(r=>r.task.kind==='delivery')
-  const result={episodes:delivery.length,entranceOnlyPassed:0,routeAwarePassed:0,changedPackage:0}
-  for(const {task} of delivery){
-    const [cheap,compact]=task.packages
-    const choose=pack=>({type:'package',id:pack.id})
-    const baseline=[choose(cheap),...(findRoute(task.grid,task.destination,cheap)??[]),{type:'submit'}]
-    if(verifyDelivery(task,baseline,rulesVersion).passed)result.entranceOnlyPassed++
-    const log=[choose(cheap)]
-    const {observation}=verifyDelivery(task,log,rulesVersion)
-    let route=findRoute(observation.grid,task.destination,cheap)
-    if(!route){
-      log.push(choose(compact))
-      route=findRoute(observation.grid,task.destination,compact)
-      result.changedPackage++
-    }
-    log.push(...(route??[]),{type:'submit'})
-    if(verifyDelivery(task,log,rulesVersion).passed)result.routeAwarePassed++
+export function compareDelivery(task,rulesVersion){
+  const [cheap,compact]=task.packages
+  const choose=pack=>({type:'package',id:pack.id})
+  const submit={type:'submit'}
+  const baseline=verifyDelivery(task,[choose(cheap),...(findRoute(task.grid,task.destination,cheap)??[]),submit],rulesVersion)
+  const log=[choose(cheap)]
+  const {observation}=verifyDelivery(task,log,rulesVersion)
+  let route=findRoute(observation.grid,task.destination,cheap)
+  if(!route){
+    log.push(choose(compact))
+    route=findRoute(observation.grid,task.destination,compact)
   }
-  return result
+  log.push(...(route??[]),submit)
+  return {baseline,constrained:verifyDelivery(task,log,rulesVersion),changedPackage:log[1]?.type==='package'}
+}
+
+export function calibrateDelivery(records,rulesVersion){
+  const results=records.filter(r=>r.task.kind==='delivery').map(({task})=>compareDelivery(task,rulesVersion))
+  return {episodes:results.length,entranceOnlyPassed:results.filter(r=>r.baseline.passed).length,
+    routeAwarePassed:results.filter(r=>r.constrained.passed).length,changedPackage:results.filter(r=>r.changedPackage).length}
 }
