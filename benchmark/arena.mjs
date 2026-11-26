@@ -1,6 +1,7 @@
+import { deliveryRecords, verifyDelivery, calibrateDelivery } from './delivery.mjs'
 import { pathToFileURL } from 'node:url'
 
-export const rulesVersion = 'arena-1'
+export const rulesVersion = 'arena-2'
 const kinds=['compatibility','suppliers','room-modes']
 const expand=(id,sku,supplier,price,days,fit=null)=>({id,sku,supplier,price,days,fit})
 const box=(x,y,w,h)=>({x,y,w,h})
@@ -65,7 +66,7 @@ function build(kind,index){
   return {task,reference:dynamic?[borderline,desk,safe]:[tight?safe:borderline,desk],
     wrong:[sofa(aisleX-(tight||dynamic?130:100)),desk],reason:'aisle.night'}
 }
-const records=kinds.flatMap(kind=>Array.from({length:30},(_,i)=>build(kind,i)))
+const records=[...kinds.flatMap(kind=>Array.from({length:30},(_,i)=>build(kind,i))),...deliveryRecords()]
 const index=new Map(records.map(record=>[record.task.id,record]))
 const lookup=id=>{
   const record=index.get(id)
@@ -78,6 +79,7 @@ export function listArena({kind,split}={}){
 }
 
 function verifier(task,log){
+  if(task.kind==='delivery')return verifyDelivery(task,log,rulesVersion)
   const state={orders:new Map(),positions:{},event:null,nextOrder:1,submitted:false}
   const violation=(rule,objects,expected,actual)=>({rule,objects,expected,actual})
   const invalid=[]
@@ -154,7 +156,7 @@ function verifier(task,log){
 export function verify(id,actionLog){
   const {task}=lookup(id)
   if(!Array.isArray(actionLog)||actionLog.length>task.maxActions)throw Error(`Журнал должен содержать до ${task.maxActions} действий`)
-  return verifier(task,actionLog)
+  return structuredClone(verifier(task,actionLog))
 }
 export function createArenaEpisode(id){
   const {task}=lookup(id)
@@ -196,6 +198,9 @@ export function checkArena(){
     const variant=records.find(({task})=>task.pair===pair.task.pair&&task.variant==='b')
     if(verify(variant.task.id,pair.reference).passed)throw Error(`A проходит в B: ${pair.task.pair}`)
   }
-  return {episodes:records.length,counts,cohorts,pairs:pairs.length,referencesPassed:records.length,knownErrorsRejected:records.length}
+  const delivery=calibrateDelivery(records,rulesVersion)
+  if(delivery.routeAwarePassed!==delivery.episodes||delivery.entranceOnlyPassed>=delivery.routeAwarePassed)
+    throw Error('Доставка не различает стратегии')
+  return {episodes:records.length,counts,cohorts,pairs:pairs.length,referencesPassed:records.length,knownErrorsRejected:records.length,delivery}
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href)console.log(JSON.stringify(checkArena(),null,2))
