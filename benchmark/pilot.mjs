@@ -295,7 +295,9 @@ function adaptationCases(){
   const result=[]
   for(const kind of ['procurement','appliances']){
     for(const original of pilots.filter(({task})=>task.kind===kind)){
-      if(result.filter(({task})=>task.kind===kind).length===5)break
+      const sameKind=result.filter(({task})=>task.kind===kind)
+      if(sameKind.length===6)break
+      if((sameKind.length===5)!==(original.task.split==='test'))continue
       const task=structuredClone(original.task)
       const initial=original.reference
       const target=initial.order.find(sku=>{
@@ -308,6 +310,10 @@ function adaptationCases(){
       const delivery=retained.length?deliveryFee:0
       const event={sku:target,days:task.deadline+5}
       task.budget+=9000
+      if(original.task.split==='test'){
+        const product=task.catalog.find(p=>p.sku===target)
+        task.catalog.push({...product,sku:`${target}-reserve`,name:`${product.name} · резервная поставка`,price:product.price+2500,stock:1})
+      }
       const restricted=delayedCatalog(task.catalog,event)
         .filter(p=>p.category===category||retained.includes(p.sku))
       try {
@@ -318,7 +324,7 @@ function adaptationCases(){
       result.push({task,initial,target,retained})
     }
   }
-  if(result.length!==10)throw Error('Не удалось собрать 10 задач на адаптацию')
+  if(result.length!==12||result.filter(({task})=>task.split==='test').length!==2)throw Error('Не удалось собрать 12 задач на адаптацию с тестовым набором')
   return result
 }
 const adaptation=adaptationCases()
@@ -497,6 +503,23 @@ export function calibrateAdaptation(){
   return {episodes:results.length,baselinePassed:results.filter(r=>r.baseline.passed).length,
     repairedPassed:results.filter(r=>r.repaired.passed).length,
     retainedOrders:results.filter(r=>r.retainedOrder).length,results}
+}
+
+export function comparePilot(){
+  const delayed=new Map(calibrateAdaptation().results.map(row=>[row.id,row]))
+  return cases.map(({task})=>{
+    const suite=task.disruption?'adaptation':task.pair?'diagnostic':'pilot'
+    if(task.disruption){
+      const {baseline,repaired}=delayed.get(task.id)
+      return {id:task.id,kind:task.kind,suite,split:task.split,baseline,constrained:repaired}
+    }
+    const episode=selectTask(task.id)
+    const observed={...episode.get_task(),catalog:episode.search_products({in_stock:false})}
+    const baseline=cheapestAnswer(observed)
+    return {id:task.id,kind:task.kind,suite,split:task.split,
+      baseline:baseline?runAnswer(task,baseline):{passed:false,actions:0,errors:['Нет допустимого плана в урезанном каталоге или первой планировке']},
+      constrained:runAnswer(task,findReference(observed))}
+  })
 }
 
 const string={type:'string'}, integer={type:'integer',minimum:0}
