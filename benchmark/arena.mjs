@@ -1,4 +1,4 @@
-import { deliveryRecords, verifyDelivery, calibrateDelivery } from './delivery.mjs'
+import { deliveryRecords, verifyDelivery, calibrateDelivery, compareDelivery } from './delivery.mjs'
 import { pathToFileURL } from 'node:url'
 
 export const rulesVersion = 'arena-2'
@@ -181,6 +181,61 @@ export function createArenaEpisode(id){
     arena_result:()=>verify(id,log)
   }
 }
+function chooseOrders(task){
+  let combinations=[[]]
+  for(const role of task.roles){
+    combinations=combinations.flatMap(ids=>task.catalog.filter(p=>p.sku===role).map(p=>[...ids,p.id]))
+  }
+  return combinations.map(products=>({type:'order',products}))
+}
+function compareShopping(task){
+  const submit={type:'submit'}
+  const cheap={type:'order',products:task.roles.map(role=>task.catalog.filter(p=>p.sku===role)
+    .sort((a,b)=>a.price-b.price)[0].id)}
+  const baseline=verify(task.id,[cheap,submit])
+  const orders=chooseOrders(task)
+  if(!task.eventType){
+    const best=orders.map(a=>verify(task.id,[a,submit])).filter(r=>r.passed).sort((a,b)=>a.metrics.cost-b.metrics.cost)[0]
+    return {baseline,constrained:best}
+  }
+  const first=verify(task.id,[cheap])
+  if(first.passed)return {baseline,constrained:baseline}
+  const cancel={type:'cancel',order:first.observation.orders[0].order}
+  const best=orders.map(a=>verify(task.id,[cheap,cancel,a,submit])).filter(r=>r.passed).sort((a,b)=>a.metrics.cost-b.metrics.cost)[0]
+  return {baseline,constrained:best}
+}
+function placeRoom(task,dayOnly){
+  const actions=[]
+  for(const [item,dimensions] of Object.entries(task.furniture)){
+    let selected
+    for(const rotate of dimensions.rotatable?[false,true]:[false]){
+      for(let offset=0;offset<task.room.w&&!selected;offset+=5){
+        const x=item==='sofa'&&dayOnly?Math.floor((task.aisle.x-dimensions.day.w-offset)/5)*5:offset
+        if(x<0)break
+        for(let y=0;y<task.room.h&&!selected;y+=5){
+          const action={type:'place',item,x,y,rotate}
+          const trial=verify(task.id,[...actions,action])
+          if(trial.violations.every(v=>v.rule==='item.missing'||(dayOnly&&v.rule.endsWith('.night'))))selected=action
+        }
+      }
+      if(selected)break
+    }
+    if(selected)actions.push(selected)
+  }
+  return verify(task.id,[...actions,{type:'submit'}])
+}
+export function compareArena(){
+  return records.map(({task})=>{
+    const {id,kind,split}=task
+    let scores
+    if(kind==='delivery')scores=compareDelivery(task,rulesVersion)
+    else if(kind==='room-modes')scores={baseline:placeRoom(task,true),constrained:placeRoom(task,false)}
+    else scores=compareShopping(createArenaEpisode(id).get_task())
+    if(!scores.constrained?.passed)throw Error(`Поиск с ограничениями не решил ${id}`)
+    return {id,kind,split,suite:'rules',baseline:scores.baseline,constrained:scores.constrained}
+  })
+}
+
 export function checkArena(){
   const counts={}, cohorts={}
   for(const {task,reference,wrong,reason} of records){
@@ -198,6 +253,9 @@ export function checkArena(){
     const variant=records.find(({task})=>task.pair===pair.task.pair&&task.variant==='b')
     if(verify(variant.task.id,pair.reference).passed)throw Error(`A проходит в B: ${pair.task.pair}`)
   }
+  const deliveryGeometry=records.filter(({task})=>task.kind==='delivery').map(({task})=>
+    JSON.stringify([task.grid,task.destination,task.event?.grid]))
+  if(new Set(deliveryGeometry).size!==deliveryGeometry.length)throw Error('Повтор геометрии доставки')
   const delivery=calibrateDelivery(records,rulesVersion)
   if(delivery.routeAwarePassed!==delivery.episodes||delivery.entranceOnlyPassed>=delivery.routeAwarePassed)
     throw Error('Доставка не различает стратегии')
