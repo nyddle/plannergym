@@ -1,3 +1,4 @@
+import { listArena, createArenaEpisode } from './arena.mjs'
 import { pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline'
 
@@ -324,12 +325,14 @@ const adaptation=adaptationCases()
 cases.push(...adaptation)
 
 export function listTasks({kind,split,suite}={}){
-  return cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split)&&(!suite||suite===(t.disruption?'adaptation':t.pair?'diagnostic':'pilot')))
+  if(suite==='rules')return listArena({kind,split})
+  const legacy=cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split)&&(!suite||suite===(t.disruption?'adaptation':t.pair?'diagnostic':'pilot')))
     .map(({id,kind,split,family,budget,deadline,pair,variant,factor,source,disruption})=>({id,kind,split,family,budget,deadline,pair,variant,factor,source,disruption}))
+  return suite?legacy:[...legacy,...listArena({kind,split})]
 }
 export function selectTask(id){
   const found=cases.find(({task})=>task.id===id)
-  if(!found)throw Error(`Неизвестная задача ${id}`)
+  if(!found)return createArenaEpisode(id)
   const {task}=found
   const orders=new Map()
   let event=null, cancellationTotal=0
@@ -504,9 +507,12 @@ const items=array(object({id:string,sku:string,x:integer,y:integer,facing:enumer
   ['id','sku','x','y','facing']),32)
 const skus=object({skus:{...array(string,32),minItems:1}},['skus'])
 const tools=[
-  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts)),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic','adaptation')})],
+  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts),'compatibility','suppliers','room-modes'),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic','adaptation','rules')})],
   ['select_task','Начать новый эпизод и сбросить виртуальные заказы',object({id:string},['id'])],
   ['get_task','План, требования, сроки и бюджет текущей задачи',object({})],
+  ['arena_action','Выполнить действие в эпизоде rules и получить наблюдение и награду. Типы: order, cancel, place, submit',
+    object({action:{type:'object',additionalProperties:true}},['action'])],
+  ['arena_result','Пересчитать результат текущего эпизода rules без изменения состояния',object({})],
   ['search_products','Поиск по каталогу виртуального магазина. Размеры в сантиметрах, цены в рублях',
     object({category:enumeration(...Object.keys(categories)),max_price:integer,max_width:integer,max_depth:integer,deadline:integer,in_stock:{type:'boolean'}})],
   ['get_product','Габариты, подключение, цена, сборка и остаток одного товара',object({sku:string},['sku'])],
@@ -521,6 +527,7 @@ function valid(value,schema){
   if(schema.enum&&!schema.enum.includes(value))return false
   switch(schema.type){
     case 'object':
+      if(schema.additionalProperties===true)return value!==null&&typeof value==='object'&&!Array.isArray(value)
       return value!==null&&typeof value==='object'&&!Array.isArray(value)&&
         schema.required.every(key=>Object.hasOwn(value,key))&&
         Object.entries(value).every(([key,item])=>Object.hasOwn(schema.properties,key)&&valid(item,schema.properties[key]))
@@ -569,6 +576,7 @@ function runMcp(){
           data=environment.get_task()
         }else{
           if(!environment)throw Error('Сначала выберите задачу через select_task')
+          if(typeof environment[tool.name]!=='function')throw Error('Действие недоступно в выбранном типе эпизода')
           data=environment[tool.name](args)
         }
         send({content:[{type:'text',text:JSON.stringify(data)}]})
