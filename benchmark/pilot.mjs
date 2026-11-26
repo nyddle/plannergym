@@ -286,27 +286,66 @@ function diagnosticPairs(){
 const pairs=diagnosticPairs()
 cases.push(...pairs.flat())
 
+const cancellationFee=900
+function delayedCatalog(catalog,event){
+  return catalog.map(p=>p.sku===event.sku?{...p,days:event.days}:p)
+}
+function adaptationCases(){
+  const result=[]
+  for(const kind of ['procurement','appliances']){
+    for(const original of pilots.filter(({task})=>task.kind===kind)){
+      if(result.filter(({task})=>task.kind===kind).length===5)break
+      const task=structuredClone(original.task)
+      const initial=original.reference
+      const target=initial.order.find(sku=>{
+        const product=task.catalog.find(p=>p.sku===sku)
+        return task.requirements.filter(r=>r.category===product.category).length===1
+      })
+      if(!target)continue
+      const category=task.catalog.find(p=>p.sku===target).category
+      const retained=initial.order.filter(sku=>sku!==target)
+      const delivery=retained.length?deliveryFee:0
+      const event={sku:target,days:task.deadline+5}
+      task.budget+=9000
+      const restricted=delayedCatalog(task.catalog,event)
+        .filter(p=>p.category===category||retained.includes(p.sku))
+      try {
+        findReference({...task,catalog:restricted,budget:task.budget-cancellationFee-delivery})
+      } catch {continue}
+      Object.assign(task,{id:`adapt-${kind}-${result.filter(x=>x.task.kind===kind).length+1}`,
+        source:original.task.id,disruption:{type:'delivery-delay',category,cancellationFee}})
+      result.push({task,initial,target,retained})
+    }
+  }
+  if(result.length!==10)throw Error('Не удалось собрать 10 задач на адаптацию')
+  return result
+}
+const adaptation=adaptationCases()
+cases.push(...adaptation)
+
 export function listTasks({kind,split,suite}={}){
-  return cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split)&&(!suite||(suite==='diagnostic')===Boolean(t.pair)))
-    .map(({id,kind,split,family,budget,deadline,pair,variant,factor,source})=>({id,kind,split,family,budget,deadline,pair,variant,factor,source}))
+  return cases.map(({task})=>task).filter(t=>(!kind||kind===t.kind)&&(!split||split===t.split)&&(!suite||suite===(t.disruption?'adaptation':t.pair?'diagnostic':'pilot')))
+    .map(({id,kind,split,family,budget,deadline,pair,variant,factor,source,disruption})=>({id,kind,split,family,budget,deadline,pair,variant,factor,source,disruption}))
 }
 export function selectTask(id){
   const found=cases.find(({task})=>task.id===id)
   if(!found)throw Error(`Неизвестная задача ${id}`)
   const {task}=found
   const orders=new Map()
+  let event=null, cancellationTotal=0
+  const catalog=()=>event?delayedCatalog(task.catalog,event):task.catalog
   let nextOrder=1, previousScore=0, steps=0, actions=0
   const inventory=()=>[...orders.values()].flat()
   const available=()=>{
     const held=tally(inventory())
-    return task.catalog.map(p=>({...p,stock:p.stock-(held.get(p.sku)??0)}))
+    return catalog().map(p=>({...p,stock:p.stock-(held.get(p.sku)??0)}))
   }
   function cart(skus){
     if(!Array.isArray(skus)||skus.length===0||skus.length>32||skus.some(sku=>typeof sku!=='string'))throw Error('Укажите от 1 до 32 SKU')
     return quote(available(),skus)
   }
   return {
-    get_task:()=>structuredClone({ ...task,catalog:undefined }),
+    get_task:()=>structuredClone({ ...task,catalog:undefined,...(task.disruption?{event,cancellationTotal,orders:[...orders].map(([order_id,skus])=>({order_id,skus}))}:{}) }),
     search_products:({category,max_price,max_width,max_depth,deadline,in_stock=true})=>available().filter(p=>
       (!category||p.category===category)&&(max_price==null||p.price<=max_price)&&
       (max_width==null||p.w<=max_width)&&(max_depth==null||p.h+p.serviceDepth<=max_depth)&&
@@ -322,24 +361,36 @@ export function selectTask(id){
       const result=cart(skus)
       const order_id=String(nextOrder++)
       orders.set(order_id,skus.slice())
+      const affected=task.disruption&&!event&&result.lines.find(({sku})=>
+        task.catalog.find(p=>p.sku===sku).category===task.disruption.category)
+      if(affected){
+        event={type:'delivery-delay',order_id,sku:affected.sku,days:task.deadline+5}
+        return {order_id,...result,days:Math.max(result.days,event.days),event:{...event}}
+      }
       return {order_id,...result}
     },
     cancel_order:({order_id})=>{
       actions++
       if(!orders.delete(order_id))throw Error('Заказ не найден')
+      if(task.disruption){
+        cancellationTotal+=task.disruption.cancellationFee
+        return {order_id,canceled:true,fee:task.disruption.cancellationFee,cancellationTotal}
+      }
       return {order_id,canceled:true}
     },
     evaluate:({layout,items})=>{
       actions++
-      const result=assess(task,{layout,items},inventory())
+      const result=assess({...task,catalog:catalog()},{layout,items},inventory())
       // Every placed order incurs its own delivery charge.
       const extraDelivery=Math.max(0,orders.size-1)*deliveryFee
-      if(result.total!==null&&result.total!==undefined)result.total+=extraDelivery
-      if(extraDelivery&&result.total>task.budget&&!result.errors.includes('Превышен бюджет'))result.errors.push('Превышен бюджет с учётом отдельных доставок')
+      const additionalCosts=extraDelivery+cancellationTotal
+      if(result.total!==null&&result.total!==undefined)result.total+=additionalCosts
+      if(additionalCosts&&result.total>task.budget&&!result.errors.includes('Превышен бюджет'))result.errors.push('Превышен бюджет с учётом доставки и отмен')
+      if(task.disruption&&!event)result.errors.push('Заказ по категории сценария ещё не оформлен')
       if(result.errors.length){result.passed=false;result.score=0}
       const reward=result.score-previousScore
       previousScore=result.score
-      return {...result,reward,evaluation:++steps,actions}
+      return {...result,reward,evaluation:++steps,actions,...(task.disruption?{event:event&&{...event},cancellationTotal}:{})}
     }
   }
 }
@@ -415,6 +466,36 @@ export function diagnose(){
     referencePassed:results.length*2,replayPassed:0,baselinePassed:baselineTotals,results}
 }
 
+export function calibrateAdaptation(){
+  const results=adaptation.map(({task,initial,target,retained})=>{
+    const episode=selectTask(task.id)
+    const retainedOrder=retained.length?episode.place_order({skus:retained}):null
+    const failedOrder=episode.place_order({skus:[target]})
+    if(failedOrder.event?.sku!==target||failedOrder.days<=task.deadline)throw Error(`Срыв не сработал: ${task.id}`)
+    const baseline=episode.evaluate(initial)
+    const cancellation=episode.cancel_order(failedOrder)
+    const observed=episode.get_task()
+    const kept=observed.orders.flatMap(order=>order.skus)
+    const candidates=episode.search_products({category:observed.disruption.category,deadline:observed.deadline})
+    const recovery=findReference({...observed,
+      budget:observed.budget-observed.cancellationTotal-observed.orders.length*deliveryFee,
+      catalog:[...candidates,...[...tally(kept)].map(([sku,stock])=>({...episode.get_product({sku}),stock}))]
+    })
+    const replacement=recovery.order.find(sku=>candidates.some(p=>p.sku===sku))
+    episode.place_order({skus:[replacement]})
+    const repaired=episode.evaluate(recovery)
+    const retainedIntact=!retainedOrder||episode.get_task().orders.some(order=>order.order_id===retainedOrder.order_id)
+    if(baseline.passed||!baseline.errors.includes('Нарушен срок')||!repaired.passed||!retainedIntact||
+       repaired.cancellationTotal!==cancellation.fee||repaired.total>task.budget||repaired.days>task.deadline)
+      throw Error(`Невалидная калибровка: ${task.id} ${repaired.errors.join(', ')}`)
+    return {id:task.id,kind:task.kind,budget:task.budget,deadline:task.deadline,
+      event:failedOrder.event,baseline,repaired,retainedOrder:Boolean(retainedOrder)}
+  })
+  return {episodes:results.length,baselinePassed:results.filter(r=>r.baseline.passed).length,
+    repairedPassed:results.filter(r=>r.repaired.passed).length,
+    retainedOrders:results.filter(r=>r.retainedOrder).length,results}
+}
+
 const string={type:'string'}, integer={type:'integer',minimum:0}
 const enumeration=(...values)=>({type:'string',enum:values})
 const array=(items,maxItems)=>({type:'array',items,maxItems})
@@ -423,7 +504,7 @@ const items=array(object({id:string,sku:string,x:integer,y:integer,facing:enumer
   ['id','sku','x','y','facing']),32)
 const skus=object({skus:{...array(string,32),minItems:1}},['skus'])
 const tools=[
-  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts)),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic')})],
+  ['list_tasks','Список задач пилота',object({kind:enumeration(...Object.keys(counts)),split:enumeration('train','validation','test'),suite:enumeration('pilot','diagnostic','adaptation')})],
   ['select_task','Начать новый эпизод и сбросить виртуальные заказы',object({id:string},['id'])],
   ['get_task','План, требования, сроки и бюджет текущей задачи',object({})],
   ['search_products','Поиск по каталогу виртуального магазина. Размеры в сантиметрах, цены в рублях',
@@ -501,9 +582,10 @@ function runMcp(){
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){
   const [command,id]=process.argv.slice(2)
   if(command==='verify')console.log(JSON.stringify(verifyPilot(),null,2))
+  else if(command==='calibrate')console.log(JSON.stringify(calibrateAdaptation(),null,2))
   else if(command==='diagnose')console.log(JSON.stringify(diagnose(),null,2))
   else if(command==='list')console.log(JSON.stringify(listTasks(),null,2))
   else if(command==='mcp')runMcp()
   else if(command==='show')console.log(JSON.stringify(selectTask(id).get_task(),null,2))
-  else throw Error('Используйте verify, diagnose, list, show <id> или mcp')
+  else throw Error('Используйте verify, diagnose, calibrate, list, show <id> или mcp')
 }
